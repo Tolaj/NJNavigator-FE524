@@ -1,4 +1,4 @@
-# NJ/NYC Transit Trip Planner (NJNavigator)
+# NJNavigator (NJ/NYC Transit Trip Planner)
 
 An LLM-powered transit assistant for the New York–New Jersey metro corridor, built with GTFS static + GTFS-Realtime feeds and the Claude API.
 
