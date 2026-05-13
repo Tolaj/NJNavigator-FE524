@@ -1,0 +1,26 @@
+httpx
+requests
+pandas
+python-dotenv
+beautifulsoup4
+lxml
+
+# GTFS-Realtime
+gtfs-realtime-bindings
+protobuf
+
+# Database
+sqlalchemy
+
+# RAG
+langchain
+langchain-community
+langchain-openai
+langchain-chroma
+langchain-text-splitters
+chromadb
+openai
+
+# Agent + MCP
+smolagents[mcp]
+fastmcp

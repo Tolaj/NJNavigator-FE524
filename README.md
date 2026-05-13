@@ -1,101 +1,164 @@
-# NJNavigator (NJ/NYC Transit Trip Planner)
+# NJNavigator — NJ/NYC Transit Assistant
 
-An LLM-powered transit assistant for the New York–New Jersey metro corridor, built with GTFS static + GTFS-Realtime feeds and the Claude API.
+A conversational transit assistant for the New York–New Jersey metro corridor.
+Ask a natural-language question about your commute and get a real-time, data-backed answer.
 
 > **FE524: Prompt Engineering Lab for Business Applications**
 > Stevens Institute of Technology | Spring 2026 | Instructor: Edward Loeser
 
 ---
 
-## The Problem
+## How It Works
 
-Existing trip planning apps (Google Maps, Transit, Moovit) return rigid, list-based itineraries with no explanation of tradeoffs and no ability to handle nuanced queries like:
+```
+User query (natural language)
+         │
+         ▼
+smolagents ToolCallingAgent  (GPT-4o-mini)
+         │
+         │  calls tools via FastMCP server
+         ▼
+┌──────────────────────────────────────┐
+│  MCP Tools                           │
+│  • search_stops                      │
+│  • get_departures  ──► SQLite GTFS   │
+│  • get_realtime_status ──► GTFS-RT   │
+│  • search_knowledge ──► ChromaDB RAG │
+│  • get_interchange_stations          │
+└──────────────────────────────────────┘
+         │
+         ▼
+  Plain-English trip recommendation
+```
 
-> *"I have a meeting at 6:30pm in Midtown — when should I leave from Journal Square?"*
-
-This project replaces that experience with a conversational transit assistant that understands natural language, knows what's happening on the network right now, and explains its recommendations in plain English.
+1. **Static GTFS** (MTA Subway, PATH, NJ Transit) loaded into SQLite at setup
+2. **GTFS-Realtime** feeds polled live per query for MTA delays and PATH arrivals
+3. **RAG knowledge base** (ChromaDB) loaded at startup with Wikipedia transit articles + live MTA service alerts
+4. **Agent** reasons over tool results and synthesises a recommendation
 
 ---
 
-## How It Works
+## Tech Stack
 
-Given a natural language query, the system:
+| Layer | Tool |
+|-------|------|
+| Agent framework | `smolagents` — ToolCallingAgent |
+| LLM | OpenAI `gpt-4o-mini` via `OpenAIServerModel` |
+| MCP server | `FastMCP` (HTTP on localhost:8000) |
+| Vector store | `ChromaDB` via `langchain-chroma` |
+| Embeddings | OpenAI `text-embedding-3-small` |
+| Schedule DB | SQLite (populated from GTFS ZIPs) |
+| RT feeds | `gtfs-realtime-bindings` + `protobuf` |
 
-1. **Loads and indexes GTFS static schedule data** for MTA Subway, PATH Train, and NJ Transit
-2. **Polls live GTFS-Realtime feeds** for current delays and service alerts
-3. **Computes candidate itineraries** by merging static and real-time data
-4. **Passes those itineraries and alerts to Claude**, which returns a clear, human-readable trip plan with the best option and any relevant caveats
+---
+
+## Project Structure
+
+```
+NJNavigator-FE524/
+├── agent.py                  # ToolCallingAgent + RAG tool definition
+├── main.py                   # entry point — starts server, builds RAG, chat loop
+├── evaluate.py               # prompt strategy evaluation harness
+├── requirements.txt
+├── .env.example
+├── data/
+│   └── interchange.csv       # hand-mapped cross-agency transfer points
+└── src/
+    ├── loaders/
+    │   ├── static_loader.py  # downloads GTFS ZIPs → SQLite (run once)
+    │   └── rt_loader.py      # MTA delays, MTA alerts, PATH arrivals
+    ├── rag/
+    │   ├── ingest.py         # Wikipedia + MTA alerts → ChromaDB
+    │   └── retrieve.py       # semantic search helpers
+    └── mcp_server.py         # FastMCP server with 5 tools
+```
 
 ---
 
 ## Data Sources
 
-### Static GTFS Feeds (schedule data)
+### Static GTFS (downloaded once by `static_loader.py`)
 
-| # | Agency | Feed Type | Source |
-|---|--------|-----------|--------|
-| 1 | MTA Subway | GTFS Static | [MTA Developer Data](http://web.mta.info/developers/data/nyct/subway/google_transit.zip) |
-| 2 | PATH Train | GTFS Static | [PANYNJ Schedules](https://www.panynj.gov/path/en/schedules-maps.html) |
-| 3 | NJ Transit | GTFS Static | [NJ Transit Developer Portal](https://developer.njtransit.com/registration/) *(registration required)* |
+| Agency | URL |
+|--------|-----|
+| MTA Subway (supplemented) | `https://rrgtfsfeeds.s3.amazonaws.com/gtfs_supplemented.zip` |
+| PATH Train | `https://data.trilliumtransit.com/gtfs/path-nj-us/path-nj-us.zip` |
+| NJ Transit Rail | `https://www.njtransit.com/rail_data.zip` |
 
-### GTFS-Realtime Feeds (live data)
+### GTFS-Realtime (polled live per query)
 
-| # | Agency | Feed Type | Source |
-|---|--------|-----------|--------|
-| 4 | MTA Subway | TripUpdates | `https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct/gtfs` |
-| 5 | MTA | Alerts | `https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/camsys/all-alerts` |
-| 6 | PATH Train | GTFS-RT | `https://path.transitdata.nyc/gtfsrt` |
-| 7 | NJ Transit Rail | TripUpdates | [NJ Transit Data Source](https://datasource.njtransit.com/) *(registration required)* |
+| Feed | URL |
+|------|-----|
+| MTA TripUpdates (8 feeds) | `https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct/gtfs*` |
+| MTA Service Alerts | `https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/camsys/all-alerts` |
+| PATH Arrivals | `https://path.transitdata.nyc/gtfsrt` |
 
-Static feeds are ZIP archives of CSV files. The core files used are: `stops.txt`, `routes.txt`, `trips.txt`, `stop_times.txt`, `calendar.txt`, `calendar_dates.txt`, and `transfers.txt`.
+> NJ Transit realtime is out of scope — NJT legs use scheduled times only.
 
-Real-time feeds provide live delay predictions (TripUpdates), service disruption text (Alerts), and vehicle positions. Alerts are passed directly to the LLM as context; TripUpdates are merged with the static schedule to produce adjusted itineraries.
+### RAG Knowledge Base (built at startup)
 
----
-
-## Evaluation
-
-We will build a ground-truth evaluation dataset of **25–30 manually verified trip queries** covering common NJ-to-NYC routes (e.g. Journal Square → Penn Station, Hoboken → Times Square). Each entry includes origin, destination, requested departure time, and a verified correct itinerary cross-checked against official MTA and NJ Transit trip planners.
-
-Model outputs are evaluated across the following dimensions:
-
-| Dimension | Method |
-|-----------|--------|
-| **Route correctness** | Compare LLM-suggested route against ground truth — correct line(s) for origin/destination pair |
-| **Departure time accuracy** | Verify suggested departure is within ±2 min of scheduled or RT-adjusted time |
-| **Transfer validity** | Confirm layover time meets minimum from `transfers.txt`; flag invalid connections |
-| **Arrival time accuracy** | End-to-end arrival within acceptable tolerance of ground truth |
-| **Hallucination detection** | Queries with no valid service — system must say no service exists, not invent a route |
-| **RT integration** | Run queries against live RT snapshot — verify delays are reflected in advised departure time |
-| **Prompt technique comparison** | Compare accuracy across few-shot, tool use, RAG, and chain-of-thought prompting strategies |
+- Wikipedia: NYC Subway, PATH, NJ Transit, MTA, GTFS
+- Live MTA service alerts (refreshed each run)
 
 ---
 
-## Getting Started
+## Setup
 
-> *Setup instructions will be added as the project develops.*
-
-### Prerequisites
-
-- Python 3.10+
-- Anthropic API key (Claude)
-- MTA API key (for real-time feeds)
-- NJ Transit developer registration
-
-### Installation
+### 1. Clone and create virtual environment
 
 ```bash
-git clone https://github.com/<your-org>/nj-nyc-transit-planner.git
-cd nj-nyc-transit-planner
-pip install -r requirements.txt
+git clone <repo-url>
+cd NJNavigator-FE524
+uv venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
 ```
 
-### Configuration
+### 2. Configure API key
 
 ```bash
 cp .env.example .env
-# Add your API keys to .env
+# Add your OpenAI API key to .env
 ```
+
+### 3. Load static GTFS data (run once)
+
+```bash
+python src/loaders/static_loader.py
+```
+
+This downloads ~35 MB of GTFS ZIPs and builds `data/transit.db`.
+
+### 4. Run the assistant
+
+```bash
+python main.py
+```
+
+`main.py` automatically:
+- Starts the MCP server in the background
+- Fetches live MTA alerts and builds the ChromaDB knowledge base
+- Opens an interactive chat loop
+
+---
+
+## Example Queries
+
+```
+You: best way from Hoboken to Penn Station at 6pm today?
+You: is the A train delayed right now?
+You: how many lines does PATH have?
+You: next NJT train from Hoboken to New York?
+```
+
+---
+
+## Known Limitations
+
+- NJ Transit realtime delays not available (no developer portal access)
+- PATH realtime has no trip continuity — next-arrival only, not full trip tracking
+- MTA bus, LIRR, Metro-North, NJT Light Rail out of scope
+- Cross-agency trip routing limited to the 5 interchange stations in `data/interchange.csv`
 
 ---
 
