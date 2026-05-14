@@ -6,7 +6,13 @@
       "Bash(.venv/bin/python -c \"import rich; print\\(rich.__version__\\)\")",
       "Bash(.venv/bin/python -c \"from rich.console import Console; c = Console\\(\\); c.print\\('[green]rich works[/green]'\\)\")",
       "Bash(.venv/bin/python -c ' *)",
-      "Bash(.venv/bin/python src/utils/rag_builder.py)"
+      "Bash(.venv/bin/python src/utils/rag_builder.py)",
+      "Bash(git filter-branch *)",
+      "Bash(git stash *)",
+      "Bash(FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch --force --index-filter 'git rm --cached --ignore-unmatch .env' --prune-empty --tag-name-filter cat -- --all)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)"
     ]
   }
 }
