@@ -1,7 +1,7 @@
 """mcp_server.py — MCP server with transit tools"""
 import json
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -20,7 +20,19 @@ DB_PATH = Path(__file__).resolve().parents[1] / "data" / "transit.db"
 engine  = create_engine(f"sqlite:///{DB_PATH}")
 mcp     = FastMCP("NJNavigator")
 
-AGENCIES = ["mta", "path", "njt", "njtbus"]
+AGENCIES    = ["mta", "path", "njt", "njtbus"]
+_rag_index  = None   # lazy-loaded on first call to search_transit_knowledge
+
+
+def _get_rag_index():
+    global _rag_index
+    if _rag_index is None:
+        try:
+            from utils.rag_builder import load_index
+            _rag_index = load_index()
+        except Exception:
+            _rag_index = False   # mark as unavailable so we don't retry
+    return _rag_index if _rag_index else None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -43,12 +55,45 @@ def haversine(lat1, lon1, lat2, lon2) -> float:
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def active_services(agency: str, stop_id: str) -> set:
+def expand_stop_ids(agency: str, stop_id: str) -> list[str]:
+    """Return platform-level stop IDs, expanding parent stations to their children.
+    Also climbs up to parent if given a child/entrance stop with no stop_times."""
+    def _children(parent: str) -> list[str]:
+        try:
+            df = sql(f"SELECT stop_id FROM {agency}_stops "
+                     f"WHERE parent_station=:sid AND (location_type IS NULL OR location_type != 1)",
+                     {"sid": parent})
+            return df["stop_id"].tolist() if not df.empty else []
+        except Exception:
+            return []
+
+    try:
+        row = sql(f"SELECT location_type, parent_station FROM {agency}_stops WHERE stop_id=:sid",
+                  {"sid": stop_id})
+        if row.empty:
+            return [stop_id]
+        loc_type = row.iloc[0]["location_type"]
+        parent   = row.iloc[0].get("parent_station")
+
+        if loc_type == 1:
+            kids = _children(stop_id)
+            return kids if kids else [stop_id]
+
+        # Child / entrance — climb to parent and expand from there
+        if parent and str(parent).strip():
+            kids = _children(str(parent))
+            return kids if kids else [stop_id]
+    except Exception:
+        pass
+    return [stop_id]
+
+
+def active_services(agency: str, stop_ids: list[str]) -> set:
     today = datetime.now().strftime("%Y%m%d")
     dow   = datetime.now().strftime("%A").lower()
     try:
         cal = sql(f"SELECT service_id FROM {agency}_calendar "
-                  f"WHERE {dow}='1' AND start_date<=:d AND end_date>=:d", {"d": today})
+                  f"WHERE {dow}=1 AND start_date<=:d AND end_date>=:d", {"d": today})
         active = set(cal["service_id"])
     except Exception:
         active = set()
@@ -60,11 +105,12 @@ def active_services(agency: str, stop_id: str) -> set:
         active  = (active | added) - removed
     except Exception:
         pass
-    if not active:  # fallback for expired GTFS
+    if not active:  # fallback for expired GTFS — sample from actual stop_times
+        ph = ",".join(f"'{s}'" for s in stop_ids)
         try:
             active = set(sql(f"SELECT DISTINCT t.service_id FROM {agency}_stop_times s "
                              f"JOIN {agency}_trips t ON s.trip_id=t.trip_id "
-                             f"WHERE s.stop_id=:sid LIMIT 20", {"sid": stop_id})["service_id"])
+                             f"WHERE s.stop_id IN ({ph}) LIMIT 20")["service_id"])
         except Exception:
             pass
     return active
@@ -102,7 +148,8 @@ def geocode_address(address: str) -> str:
     for ag in AGENCIES:
         try:
             df   = sql(f"SELECT stop_id, stop_name, stop_lat, stop_lon FROM {ag}_stops "
-                       f"WHERE stop_lat IS NOT NULL AND stop_lat != ''")
+                       f"WHERE stop_lat IS NOT NULL AND stop_lat != '' "
+                       f"AND (location_type IS NULL OR location_type != 2)")
             df   = df.dropna(subset=["stop_lat", "stop_lon"])
             df["dist"] = df.apply(lambda r: haversine(lat, lon, float(r.stop_lat), float(r.stop_lon)), axis=1)
             best = df.nsmallest(1, "dist").iloc[0]
@@ -136,22 +183,25 @@ def get_departures(stop_id: str, agency: str, after_time: str, toward: str = "")
     Next scheduled departures from a stop.
     agency: mta / path / njt / njtbus.  after_time: HH:MM:SS.
     toward: optional headsign keyword to filter direction.
+    Pass the canonical stop_id (parent station or platform) — parent stations are expanded automatically.
     """
-    ag     = agency.lower()
-    active = active_services(ag, stop_id)
+    ag       = agency.lower()
+    stop_ids = expand_stop_ids(ag, stop_id)
+    active   = active_services(ag, stop_ids)
     if not active:
         return json.dumps({"message": "No active services today."})
 
-    ph = ",".join(f"'{s}'" for s in active)
+    svc_ph  = ",".join(f"'{s}'" for s in active)
+    stop_ph = ",".join(f"'{s}'" for s in stop_ids)
     df = sql(f"""
         SELECT st.departure_time, t.trip_headsign,
                COALESCE(r.route_long_name, r.route_short_name, t.route_id) AS route_name
         FROM   {ag}_stop_times st
         JOIN   {ag}_trips t  ON st.trip_id  = t.trip_id
         LEFT JOIN {ag}_routes r ON t.route_id = r.route_id
-        WHERE  st.stop_id=:sid AND t.service_id IN ({ph})
+        WHERE  st.stop_id IN ({stop_ph}) AND t.service_id IN ({svc_ph})
         ORDER  BY st.departure_time
-    """, {"sid": stop_id})
+    """)
 
     df = df[df["departure_time"] >= after_time]
     if toward:
@@ -179,7 +229,20 @@ def get_realtime_status(routes: str) -> str:
     result: dict = {}
 
     if "PATH" in route_list:
-        result["path_arrivals"] = {k: v[:3] for k, v in list(get_path_arrivals().items())[:6]}
+        raw = get_path_arrivals()
+        formatted = {}
+        for stop_id, arrivals in list(raw.items())[:6]:
+            readable = []
+            for a in arrivals[:3]:
+                ts = a.get("arrival_time")
+                time_str = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone().strftime("%H:%M") if ts else "?"
+                readable.append({
+                    "arrival_time": time_str,
+                    "headsign": a.get("headsign", ""),
+                    "trip_id": a.get("trip_id", ""),
+                })
+            formatted[stop_id] = readable
+        result["path_arrivals"] = formatted
 
     mta = [r for r in route_list if r != "PATH"]
     if mta:
@@ -187,6 +250,24 @@ def get_realtime_status(routes: str) -> str:
         result["mta_delays"] = {"delayed_trip_count": len(delays)}
 
     return json.dumps(result or {"message": "No data."})
+
+
+@mcp.tool()
+def get_service_alerts(agency: str = "mta") -> str:
+    """
+    Active service disruption alerts.
+    agency: 'mta' (subway alerts) or 'path' (PATH has no separate alert feed — use get_realtime_status).
+    Returns up to 10 current alerts with affected routes and description.
+    """
+    agency = agency.lower()
+    if agency != "mta":
+        return json.dumps({"message": "Only MTA alerts are available. For PATH use get_realtime_status."})
+
+    from utils.rt_loader import get_mta_alerts
+    alerts = get_mta_alerts()
+    if not alerts:
+        return json.dumps({"message": "No active MTA service alerts."})
+    return json.dumps({"alerts": alerts[:10]})
 
 
 @mcp.tool()
@@ -242,6 +323,28 @@ def get_interchange(from_agency: str, to_agency: str) -> str:
     ]
 
     return json.dumps({"interchange": matches} if matches else {"message": "No interchange found."})
+
+
+@mcp.tool()
+def search_transit_knowledge(query: str) -> str:
+    """
+    Semantic search over transit route descriptions, station summaries, and transfer hubs.
+    Use this for questions like:
+      - "what lines serve Times Square?"
+      - "which PATH station is near WTC?"
+      - "tell me about the Northeast Corridor"
+      - "what NJT bus routes go to NYC?"
+    Do NOT use for live schedules or departure times — use get_departures for those.
+    """
+    idx = _get_rag_index()
+    if idx is None:
+        return json.dumps({"message": "Knowledge index not available."})
+    try:
+        docs = idx.similarity_search(query, k=4)
+        results = [{"content": d.page_content, "source": d.metadata} for d in docs]
+        return json.dumps({"results": results})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
 
 if __name__ == "__main__":

@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Bash(python -c ' *)",
+      "Bash(.venv/bin/python -c \"import rich; print\\(rich.__version__\\)\")",
+      "Bash(.venv/bin/python -c \"from rich.console import Console; c = Console\\(\\); c.print\\('[green]rich works[/green]'\\)\")",
+      "Bash(.venv/bin/python -c ' *)",
+      "Bash(.venv/bin/python src/utils/rag_builder.py)"
     ]
   }
 }
