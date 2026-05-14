@@ -1,6 +1,0 @@
-station_name,mta_stop_id,path_stop_id,njt_stop_id,min_transfer_minutes,notes
-Penn Station NY,A28,781,105,8,ACE/123 subway to NJT/PATH 33 St - 2 block walk
-Hoboken Terminal,,26733,38187,5,PATH and NJT share terminal building
-Newark Penn Station,,26731,107,4,PATH and NJT share station
-Journal Square,,26730,,0,PATH only
-World Trade Center,,26734,,10,Fulton St MTA stops nearby - 2 block walk
