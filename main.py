@@ -1,213 +1,232 @@
-# main.py
-#
-# NJNavigator entry point.
-# Starts the MCP server as a background process, builds the RAG knowledge base,
-# then runs an interactive chat loop.
-#
-# Usage:
-#   python main.py
-#
-# First-time setup (run once before main.py):
-#   python src/loaders/static_loader.py
-
-import json
-import os
+"""main.py — NJNavigator entry point"""
 import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from rich.console import Console
-from rich.markdown import Markdown
-from rich.panel import Panel
-from rich.theme import Theme
-
-_theme = Theme(
-    {
-        "info": "bold cyan",
-        "success": "bold green",
-        "warn": "bold yellow",
-        "error": "bold red",
-    }
-)
-_console = Console(theme=_theme, highlight=False)
-
 from dotenv import load_dotenv
+from rich.console import Console
+from rich.panel import Panel
+from rich.rule import Rule
+from rich.table import Table
+from rich import box
 
 load_dotenv()
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "data" / "transit.db"
+BASE_DIR      = Path(__file__).resolve().parent
+DB_PATH       = BASE_DIR / "data" / "transit.db"
+CHROMA_DIR    = BASE_DIR / "data" / "chroma_db"
+console       = Console()
 
 
-def check_prerequisites() -> bool:
-    if not os.environ.get("OPENAI_API_KEY"):
-        print("ERROR: OPENAI_API_KEY not set. Add it to your .env file.")
-        return False
-    if not DB_PATH.exists():
-        print("ERROR: transit.db not found.")
-        print("Run this first:  python src/loaders/static_loader.py")
-        return False
-    return True
-
-
-def _kill_port(port: int) -> None:
-    """Kill any process already listening on the given port."""
+def _ensure_rag_index() -> None:
+    """Build the ChromaDB knowledge index if it hasn't been built yet."""
+    import chromadb
     try:
-        result = subprocess.run(
-            ["lsof", "-ti", f"tcp:{port}"], capture_output=True, text=True
-        )
-        pids = result.stdout.strip().split()
+        client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+        col = client.get_or_create_collection("transit_knowledge")
+        if col.count() > 0:
+            return  # already built
+    except Exception:
+        pass
+    console.print("[yellow]Building knowledge index (first run only) ...[/yellow]")
+    sys.path.insert(0, str(BASE_DIR / "src"))
+    from utils.rag_builder import build_index
+    build_index()
+    console.print("[green]Knowledge index ready.[/green]\n")
+
+
+def kill_port(port: int) -> None:
+    try:
+        pids = subprocess.run(["lsof", "-ti", f"tcp:{port}"], capture_output=True, text=True).stdout.split()
         for pid in pids:
-            try:
-                subprocess.run(["kill", "-9", pid], check=False)
-            except Exception:
-                pass
+            subprocess.run(["kill", "-9", pid], check=False)
         if pids:
             time.sleep(0.5)
     except Exception:
         pass
 
 
-def start_mcp_server() -> subprocess.Popen:
-    print("[Startup] Starting MCP server ...")
-    _kill_port(8000)  # clear any leftover process from a previous run
+def _extract_section(text: str, header: str) -> list[str]:
+    """Return lines under a section header until the next all-caps header."""
+    lines   = text.splitlines()
+    capture = False
+    result  = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.upper() == header.upper():
+            capture = True
+            continue
+        if capture:
+            if re.match(r'^[A-Z]{3,}$', stripped):   # next section header
+                break
+            if stripped:
+                result.append(stripped)
+    return result
+
+
+def _parse_legs(text: str) -> list[dict]:
+    """Parse all LEG N | Route blocks from the LEGS section."""
+    legs_text = ""
+    lines     = text.splitlines()
+    in_legs   = False
+    for line in lines:
+        if line.strip().upper() == "LEGS":
+            in_legs = True
+            continue
+        if in_legs:
+            if re.match(r'^[A-Z]{3,}$', line.strip()):
+                break
+            legs_text += line + "\n"
+
+    legs    = []
+    current = {}
+    for line in legs_text.splitlines():
+        m_header = re.match(r'(?i)leg\s*\d+\s*\|\s*(.+)', line.strip())
+        if m_header:
+            if current:
+                legs.append(current)
+            current = {"route": m_header.group(1).strip(), "board": "", "alight": "", "travel": ""}
+            continue
+        m_board  = re.match(r'(?i)board\s*:\s*(.+)', line.strip())
+        m_alight = re.match(r'(?i)alight\s*:\s*(.+)', line.strip())
+        m_travel = re.match(r'(?i)travel\s*:\s*(.+)', line.strip())
+        if m_board  and current: current["board"]  = m_board.group(1).strip()
+        if m_alight and current: current["alight"] = m_alight.group(1).strip()
+        if m_travel and current: current["travel"] = m_travel.group(1).strip()
+    if current:
+        legs.append(current)
+    return legs
+
+
+def render_response(text: str) -> None:
+    """Render a structured NJNavigator response using rich."""
+
+    # ── Summary panel ─────────────────────────────────────────────────────────
+    summary_lines = _extract_section(text, "SUMMARY")
+    if summary_lines:
+        summary_text = "\n".join(f"  {l}" for l in summary_lines)
+        console.print(Panel(
+            summary_text,
+            title="[bold cyan]Trip Summary[/bold cyan]",
+            border_style="cyan",
+            padding=(0, 1),
+        ))
+    else:
+        # No structured format found — fall back to plain markdown rendering
+        console.print(Panel(text, title="[bold cyan]NJNavigator[/bold cyan]", border_style="cyan"))
+        return
+
+    # ── Legs table ────────────────────────────────────────────────────────────
+    legs = _parse_legs(text)
+    if legs:
+        table = Table(
+            box=box.ROUNDED,
+            show_header=True,
+            header_style="bold white on dark_blue",
+            border_style="blue",
+            expand=True,
+        )
+        table.add_column("Leg",    style="bold yellow", no_wrap=True, width=4)
+        table.add_column("Route",  style="bold white",  ratio=3)
+        table.add_column("Board",  style="green",       ratio=4)
+        table.add_column("Alight", style="bright_cyan", ratio=4)
+        table.add_column("Travel", style="magenta",     no_wrap=True, width=10)
+
+        for i, leg in enumerate(legs, 1):
+            table.add_row(
+                str(i),
+                leg["route"],
+                leg["board"],
+                leg["alight"],
+                leg["travel"],
+            )
+        console.print(table)
+
+    # ── Alerts ────────────────────────────────────────────────────────────────
+    alerts = _extract_section(text, "ALERTS")
+    if alerts and not (len(alerts) == 1 and alerts[0].lower() == "none"):
+        alert_text = "\n".join(f"  [yellow]⚠[/yellow]  {a.lstrip('•- ')}" for a in alerts)
+        console.print(Panel(
+            alert_text,
+            title="[bold yellow]Service Alerts[/bold yellow]",
+            border_style="yellow",
+            padding=(0, 1),
+        ))
+
+    # ── Notes ─────────────────────────────────────────────────────────────────
+    notes = _extract_section(text, "NOTES")
+    if notes:
+        notes_text = "  " + "  ".join(notes)
+        console.print(Panel(
+            notes_text,
+            title="[bold green]Notes[/bold green]",
+            border_style="green",
+            padding=(0, 1),
+        ))
+
+
+def main():
+    if not DB_PATH.exists():
+        console.print("[yellow]transit.db not found — running setup.py ...[/yellow]")
+        subprocess.run([sys.executable, str(BASE_DIR / "src" / "utils" / "setup.py")], check=True)
+
+    _ensure_rag_index()
+    kill_port(8000)
     proc = subprocess.Popen(
         [sys.executable, str(BASE_DIR / "src" / "mcp_server.py")],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    time.sleep(3)  # give it time to bind to port 8000
-    print("[Startup] MCP server ready on http://localhost:8000/mcp")
-    return proc
+    time.sleep(2)
 
+    from src.agent import build_agent
+    agent, mcp_client = build_agent()
 
-def build_rag() -> object:
-    from src.loaders.rt_loader import get_mta_alerts
-    from src.rag.ingest import build_vectorstore
+    console.print(Rule("[bold cyan]NJNavigator — NJ/NYC Transit Assistant[/bold cyan]", style="cyan"))
+    console.print("[dim]Type your trip question. Type [bold]exit[/bold] to quit.[/dim]\n")
 
-    print("[Startup] Fetching live MTA alerts ...")
-    try:
-        alerts = get_mta_alerts()
-        print(f"  {len(alerts)} active alerts fetched")
-    except Exception as e:
-        print(f"  Alert fetch failed ({e}) — continuing without live alerts")
-        alerts = []
+    history: list[tuple[str, str]] = []
+    MAX_HISTORY = 3
 
-    return build_vectorstore(alerts)
-
-
-_STREET_RE = re.compile(
-    r"\b\d+\s+(?:[A-Za-z]+\s+){1,4}(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Blvd|Boulevard|Dr(?:ive)?|Ln|Lane|Way|Pl(?:ace)?|Ct|Court|Pkwy)\b",
-    re.IGNORECASE,
-)
-
-
-def _extract_address(question: str, m: re.Match) -> str:
-    """Extract a fuller address string by grabbing context after the street match."""
-    # Take from match start to up to 40 chars after (captures city like "Jersey City, NJ")
-    # but stop at trip-direction words like "to", "toward", "->", "and get to"
-    tail = question[m.start() :]
-    # cut at transition words that introduce the destination
-    cut = re.search(r"\s+(?:to\b|toward|->|and\s+get)", tail, re.IGNORECASE)
-    addr = tail[: cut.start()].strip() if cut else tail.strip()
-    # append NJ/NY region hint if no state is mentioned
-    if not re.search(r"\b(?:NJ|NY|New\s+Jersey|New\s+York)\b", addr, re.IGNORECASE):
-        addr += ", NJ, USA"
-    return addr
-
-
-def enrich_with_geocode(question: str) -> str:
-    """If the question contains a street address, pre-resolve it to nearby stops."""
-    m = _STREET_RE.search(question)
-    if not m:
-        return question
-    try:
-        from src.mcp_server import geocode_address
-
-        address = _extract_address(question, m)
-        raw = json.loads(geocode_address(address))
-        if "nearest_stops" not in raw:
+    def build_prompt(question: str) -> str:
+        if not history:
             return question
-        stops_str = "; ".join(
-            f"{s['stop_name']} ({s['agency']}, {s['distance_miles']} mi away, stop_id={s['stop_id']})"
-            for s in raw["nearest_stops"]
-        )
+        ctx = "\n".join(f"User: {q}\nAssistant: {a}" for q, a in history[-MAX_HISTORY:])
         return (
-            f"{question}\n\n"
-            f"[System note: the origin address was geocoded to lat={raw['lat']}, lon={raw['lon']}. "
-            f"Nearest transit stops: {stops_str}. "
-            f"Use the closest stop as the origin — do NOT call geocode_address or search_stops for the origin.]"
+            f"Conversation so far:\n{ctx}\n\n"
+            f"User follow-up: {question}\n"
+            f"Answer the follow-up using context from the conversation above."
         )
-    except Exception:
-        return question
-
-
-def main():
-    print("=" * 52)
-    print("  NJNavigator — NJ/NYC Transit Assistant")
-    print("  MTA Subway · PATH Train · NJ Transit Rail")
-    print("=" * 52 + "\n")
-
-    if not check_prerequisites():
-        sys.exit(1)
-
-    mcp_proc = start_mcp_server()
 
     try:
-        vectorstore = build_rag()
+        while True:
+            console.print("[bold cyan]You:[/bold cyan] ", end="")
+            try:
+                question = input().strip()
+            except (KeyboardInterrupt, EOFError):
+                console.print("\n[dim]Goodbye![/dim]")
+                break
 
-        import agent as agent_module
+            if not question:
+                continue
+            if question.lower() in {"exit", "quit", "q"}:
+                console.print("[dim]Goodbye![/dim]")
+                break
 
-        agent_module.set_vectorstore(vectorstore)
-        ag, mcp_client = agent_module.build_agent()
+            console.print()
+            with console.status("[cyan]Planning your trip...[/cyan]", spinner="dots"):
+                answer = str(agent.run(build_prompt(question)))
 
-        print("Ready. Ask me anything about your commute.\n")
+            history.append((question, answer))
 
-        history: list[tuple[str, str]] = []  # [(user_question, assistant_answer), ...]
-        MAX_HISTORY = 3  # keep last 3 exchanges as context
-
-        def build_prompt(question: str) -> str:
-            enriched = enrich_with_geocode(question)
-            if not history:
-                return f"Question: {enriched}"
-            ctx = "\n".join(
-                f"User: {q}\nAssistant: {a}" for q, a in history[-MAX_HISTORY:]
-            )
-            return (
-                f"Conversation so far:\n{ctx}\n\n"
-                f"User follow-up: {enriched}\n"
-                f"Answer the follow-up using context from the conversation above."
-            )
-
-        try:
-            while True:
-                try:
-                    question = input("You: ").strip()
-                except (KeyboardInterrupt, EOFError):
-                    print("\nGoodbye!")
-                    break
-
-                if not question:
-                    continue
-                if question.lower() in {"exit", "quit", "q"}:
-                    print("Goodbye!")
-                    break
-
-                print()
-                try:
-                    prompt = build_prompt(question)
-                    answer = ag.run(prompt)
-                    history.append((question, str(answer)))
-                    print(f"NJNavigator: {answer}\n")
-                except Exception as e:
-                    print(f"NJNavigator: Sorry, something went wrong — {e}\n")
-        finally:
-            mcp_client.__exit__(None, None, None)
-
+            console.print()
+            render_response(answer)
+            console.print()
     finally:
-        mcp_proc.terminate()
+        mcp_client.__exit__(None, None, None)
+        proc.terminate()
 
 
 if __name__ == "__main__":

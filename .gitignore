@@ -1,36 +1,5 @@
-# Environment
+data/
 .env
-*.env
-
-# Python
 __pycache__/
-*.py[cod]
-*.pyo
+*.pyc
 .venv/
-venv/
-*.egg-info/
-dist/
-build/
-
-# Data — large files, downloaded at setup
-data/static/
-data/transit.db
-data/snapshots/
-
-# ChromaDB — rebuilt at startup
-data/chroma_db/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-.claude/
-.venv/
-
-# macOS
-.DS_Store
-
-# Jupyter
-.ipynb_checkpoints/
-notebooks/.ipynb_checkpoints/

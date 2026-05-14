@@ -1,7 +1,7 @@
 # NJNavigator — NJ/NYC Transit Assistant
 
 A conversational transit assistant for the New York–New Jersey metro corridor.
-Ask a natural-language question about your commute and get a real-time, data-backed answer.
+Ask a natural-language question about your commute and get a real-time, data-backed answer with a structured trip plan rendered directly in the terminal.
 
 > **FE524: Prompt Engineering Lab for Business Applications**
 > Stevens Institute of Technology | Spring 2026 | Instructor: Edward Loeser
@@ -15,26 +15,39 @@ User query (natural language)
          │
          ▼
 smolagents ToolCallingAgent  (GPT-4o-mini)
-         │
-         │  calls tools via FastMCP server
+         │  builds context-aware prompt from conversation history (last 3 turns)
+         │  calls tools via FastMCP server (localhost:8000)
          ▼
-┌──────────────────────────────────────┐
-│  MCP Tools                           │
-│  • search_stops                      │
-│  • get_departures  ──► SQLite GTFS   │
-│  • get_realtime_status ──► GTFS-RT   │
-│  • search_knowledge ──► ChromaDB RAG │
-│  • get_interchange_stations          │
-└──────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│  MCP Tools (9 total)                                │
+│                                                     │
+│  Knowledge                                          │
+│  • search_transit_knowledge ──► ChromaDB RAG        │
+│                                                     │
+│  Schedule (static)                                  │
+│  • search_stops         ──► SQLite GTFS             │
+│  • get_departures        ──► SQLite GTFS            │
+│  • get_transfers         ──► SQLite GTFS            │
+│  • get_interchange       ──► hardcoded interchange  │
+│  • geocode_address       ──► Nominatim OSM          │
+│                                                     │
+│  Real-time                                          │
+│  • get_realtime_status   ──► GTFS-RT feeds          │
+│  • get_service_alerts    ──► MTA Alerts feed        │
+│                                                     │
+│  Utility                                            │
+│  • get_current_time                                 │
+└─────────────────────────────────────────────────────┘
          │
          ▼
-  Plain-English trip recommendation
+  Structured trip plan rendered with Rich
+  (Summary panel · Legs table · Alerts · Notes)
 ```
 
-1. **Static GTFS** (MTA Subway, PATH, NJ Transit) loaded into SQLite at setup
-2. **GTFS-Realtime** feeds polled live per query for MTA delays and PATH arrivals
-3. **RAG knowledge base** (ChromaDB) loaded at startup with Wikipedia transit articles + live MTA service alerts
-4. **Agent** reasons over tool results and synthesises a recommendation
+1. **Static GTFS** — MTA Subway, PATH, NJ Transit Rail, NJ Transit Bus (routes 100–199) loaded into SQLite at setup
+2. **GTFS-Realtime** — MTA delay feeds and PATH arrival feed polled live per query
+3. **RAG knowledge base** — ChromaDB index of route descriptions and station summaries, built from the GTFS data itself (first run only)
+4. **Agent** — reasons step-by-step over tool results using chain-of-thought prompting and few-shot examples, then renders a structured answer
 
 ---
 
@@ -44,11 +57,13 @@ smolagents ToolCallingAgent  (GPT-4o-mini)
 |-------|------|
 | Agent framework | `smolagents` — ToolCallingAgent |
 | LLM | OpenAI `gpt-4o-mini` via `OpenAIServerModel` |
-| MCP server | `FastMCP` (HTTP on localhost:8000) |
+| MCP server | `FastMCP` (streamable-HTTP on localhost:8000) |
 | Vector store | `ChromaDB` via `langchain-chroma` |
 | Embeddings | OpenAI `text-embedding-3-small` |
-| Schedule DB | SQLite (populated from GTFS ZIPs) |
+| Schedule DB | SQLite — populated from GTFS ZIPs via `gtfs_kit` |
 | RT feeds | `gtfs-realtime-bindings` + `protobuf` |
+| Terminal UI | `rich` — panels, tables, spinners |
+| Geocoding | Nominatim (OpenStreetMap) — no API key required |
 
 ---
 
@@ -56,49 +71,57 @@ smolagents ToolCallingAgent  (GPT-4o-mini)
 
 ```
 NJNavigator-FE524/
-├── agent.py                  # ToolCallingAgent + RAG tool definition
-├── main.py                   # entry point — starts server, builds RAG, chat loop
-├── evaluate.py               # prompt strategy evaluation harness
+├── main.py                        # entry point — chat loop, rich renderer, RAG check
 ├── requirements.txt
-├── .env.example
+├── .env                           # OPENAI_API_KEY
 ├── data/
-│   └── interchange.csv       # hand-mapped cross-agency transfer points
+│   ├── transit.db                 # SQLite — all GTFS static data
+│   ├── chroma_db/                 # ChromaDB vector index (built on first run)
+│   └── zip/                       # downloaded GTFS ZIPs (mta, path, njt, njtbus)
 └── src/
-    ├── loaders/
-    │   ├── static_loader.py  # downloads GTFS ZIPs → SQLite (run once)
-    │   └── rt_loader.py      # MTA delays, MTA alerts, PATH arrivals
-    ├── rag/
-    │   ├── ingest.py         # Wikipedia + MTA alerts → ChromaDB
-    │   └── retrieve.py       # semantic search helpers
-    └── mcp_server.py         # FastMCP server with 5 tools
+    ├── agent.py                   # ToolCallingAgent + system prompt (CoT + few-shot)
+    ├── mcp_server.py              # FastMCP server — all 9 MCP tools
+    └── utils/
+        ├── setup.py               # downloads GTFS ZIPs → transit.db (run once)
+        ├── rt_loader.py           # MTA delays, MTA alerts, PATH arrivals (GTFS-RT)
+        └── rag_builder.py         # builds / loads ChromaDB index from GTFS data
 ```
 
 ---
 
 ## Data Sources
 
-### Static GTFS (downloaded once by `static_loader.py`)
+### Static GTFS — downloaded once by `src/utils/setup.py`
 
-| Agency | URL |
-|--------|-----|
-| MTA Subway (supplemented) | `https://rrgtfsfeeds.s3.amazonaws.com/gtfs_supplemented.zip` |
+| Agency | Feed URL |
+|--------|----------|
+| MTA Subway | `https://rrgtfsfeeds.s3.amazonaws.com/gtfs_supplemented.zip` |
 | PATH Train | `https://data.trilliumtransit.com/gtfs/path-nj-us/path-nj-us.zip` |
 | NJ Transit Rail | `https://www.njtransit.com/rail_data.zip` |
+| NJ Transit Bus (routes 100–199) | `https://www.njtransit.com/bus_data.zip` |
 
-### GTFS-Realtime (polled live per query)
+Loaded tables per agency: `stops`, `routes`, `trips`, `stop_times`, `calendar`, `calendar_dates`, `transfers`
+
+### GTFS-Realtime — polled live per query
 
 | Feed | URL |
 |------|-----|
-| MTA TripUpdates (8 feeds) | `https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct/gtfs*` |
+| MTA TripUpdates (7 sub-feeds) | `https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct/gtfs*` |
 | MTA Service Alerts | `https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/camsys/all-alerts` |
 | PATH Arrivals | `https://path.transitdata.nyc/gtfsrt` |
 
-> NJ Transit realtime is out of scope — NJT legs use scheduled times only.
+Requires `MTA_API_KEY` in `.env` for MTA feeds. PATH feed is unauthenticated.
 
-### RAG Knowledge Base (built at startup)
+> NJ Transit realtime is out of scope — NJT legs use static scheduled times only.
 
-- Wikipedia: NYC Subway, PATH, NJ Transit, MTA, GTFS
-- Live MTA service alerts (refreshed each run)
+### RAG Knowledge Base — built from GTFS data on first run
+
+| Document type | Count | Source |
+|---------------|-------|--------|
+| Route descriptions | 123 | `{agency}_routes` — route name + description |
+| Station summaries | 509 | MTA/PATH parent stations + their serving lines |
+| Interchange hubs | 10 | Hardcoded cross-agency transfer points |
+| **Total** | **642** | |
 
 ---
 
@@ -109,56 +132,93 @@ NJNavigator-FE524/
 ```bash
 git clone <repo-url>
 cd NJNavigator-FE524
-uv venv
-source .venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+Or with `uv`:
+```bash
+uv venv && source .venv/bin/activate
 uv pip install -r requirements.txt
 ```
 
-### 2. Configure API key
+### 2. Configure API keys
 
 ```bash
-cp .env.example .env
-# Add your OpenAI API key to .env
+# .env
+OPENAI_API_KEY=sk-...
+MTA_API_KEY=...          # optional — get free at https://api.mta.info
 ```
 
-### 3. Load static GTFS data (run once)
-
-```bash
-python src/loaders/static_loader.py
-```
-
-This downloads ~35 MB of GTFS ZIPs and builds `data/transit.db`.
-
-### 4. Run the assistant
+### 3. Run
 
 ```bash
 python main.py
 ```
 
-`main.py` automatically:
-- Starts the MCP server in the background
-- Fetches live MTA alerts and builds the ChromaDB knowledge base
-- Opens an interactive chat loop
+On first launch `main.py` automatically:
+1. Downloads GTFS ZIPs and builds `data/transit.db` (if missing)
+2. Builds the ChromaDB knowledge index — **one-time, ~30 s** (if missing)
+3. Starts the MCP server in the background
+4. Opens the interactive chat loop
+
+Every subsequent run skips steps 1–2 and starts in ~2 seconds.
 
 ---
 
 ## Example Queries
 
 ```
-You: best way from Hoboken to Penn Station at 6pm today?
-You: is the A train delayed right now?
-You: how many lines does PATH have?
-You: next NJT train from Hoboken to New York?
+You: I want to go from 31 Hopkins Ave, Jersey City to NYC
+You: How do I get from Princeton to Penn Station?
+You: Is the A train delayed right now?
+You: What lines serve Times Square?
+You: Next PATH train from Journal Square to 33rd Street
+You: I need to be at Times Square by 9am, leaving from Hoboken
+```
+
+Follow-up questions work too — the last 3 exchanges are kept as context:
+```
+You: how do I get from Princeton to NYC?
+   → [trip plan]
+You: what if I leave an hour later?
+   → [adjusted plan using prior context]
+```
+
+---
+
+## Terminal Output
+
+Each answer is rendered as structured Rich panels:
+
+```
+╭────────────────── Trip Summary ──────────────────╮
+│  Origin: Princeton                               │
+│  Destination: New York Penn Station              │
+│  Departs: 5:25 AM   Arrives: ~6:50 AM           │
+│  Total time: ~85 min   Transfers: 1              │
+╰──────────────────────────────────────────────────╯
+┌─────┬───────────────────┬──────────────┬─────────────────────┬────────────┐
+│ Leg │ Route             │ Board        │ Alight              │ Travel     │
+├─────┼───────────────────┼──────────────┼─────────────────────┼────────────┤
+│ 1   │ Princeton Shuttle │ Princeton    │ Princeton Jct.      │ ~5 min     │
+│ 2   │ Northeast Corridor│ Princeton Jct│ New York Penn Sta.  │ ~65 min    │
+└─────┴───────────────────┴──────────────┴─────────────────────┴────────────┘
+╭──────────────────── Notes ───────────────────────╮
+│  No delays on NEC. Next NEC train at 5:56 AM.   │
+╰──────────────────────────────────────────────────╯
 ```
 
 ---
 
 ## Known Limitations
 
-- NJ Transit realtime delays not available (no developer portal access)
-- PATH realtime has no trip continuity — next-arrival only, not full trip tracking
-- MTA bus, LIRR, Metro-North, NJT Light Rail out of scope
-- Cross-agency trip routing limited to the 5 interchange stations in `data/interchange.csv`
+- NJ Transit realtime delays not available (NJT developer portal registration required)
+- PATH realtime returns next-arrival times only — no full-trip delay tracking
+- MTA bus, LIRR, Metro-North, and NJT Light Rail are out of scope
+- Cross-agency routing covers the 10 hardcoded interchange stations in `mcp_server.py`
+- GTFS static data may expire — the calendar fallback in `active_services()` handles this gracefully
 
 ---
 

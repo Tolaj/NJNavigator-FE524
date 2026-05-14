@@ -1,416 +1,352 @@
-"""
-FastMCP server — exposes 7 tools to the smolagents ToolCallingAgent.
-
-Tools:
-  get_current_time        — current date/time (always call when no time specified)
-  geocode_address         — street address → nearest transit stops (Nominatim + Haversine)
-  search_stops            — fuzzy stop name lookup across MTA / PATH / NJT
-  get_departures          — next scheduled departures from a stop
-  get_realtime_status     — live MTA delays + PATH next arrivals
-  search_knowledge        — RAG search (Wikipedia + MTA alerts via ChromaDB)
-  get_interchange_stations — cross-agency transfer points
-
-Run:  python src/mcp_server.py
-      → HTTP server on http://localhost:8000/mcp
-"""
-
-import csv
+"""mcp_server.py — MCP server with transit tools"""
 import json
 import math
-import os
-import sqlite3
-import sys
-import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
+import pandas as pd
+import requests
 from dotenv import load_dotenv
 from fastmcp import FastMCP
-
-# Ensure project root is on sys.path so 'src' package is importable
-_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
+from sqlalchemy import create_engine, text
 
 load_dotenv()
 
-try:
-    from src.loaders.rt_loader import get_mta_delays, get_path_arrivals
-    _RT_AVAILABLE = True
-except Exception as _rt_err:
-    _RT_AVAILABLE = False
-    _RT_ERROR = str(_rt_err)
-    def get_mta_delays(*a, **kw): return {}   # type: ignore[misc]
-    def get_path_arrivals(*a, **kw): return {} # type: ignore[misc]
+# ensure src/ is on path so utils.rt_loader resolves when run as subprocess
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-BASE_DIR         = Path(__file__).resolve().parents[1]
-DB_PATH          = BASE_DIR / "data" / "transit.db"
-INTERCHANGE_PATH = BASE_DIR / "data" / "interchange.csv"
+DB_PATH = Path(__file__).resolve().parents[1] / "data" / "transit.db"
+engine  = create_engine(f"sqlite:///{DB_PATH}")
+mcp     = FastMCP("NJNavigator")
 
-mcp = FastMCP("NJNavigator")
+AGENCIES    = ["mta", "path", "njt", "njtbus"]
+_rag_index  = None   # lazy-loaded on first call to search_transit_knowledge
 
-# ── ChromaDB vectorstore (injected by main.py before server starts) ──────────
 
-_vectorstore = None
+def _get_rag_index():
+    global _rag_index
+    if _rag_index is None:
+        try:
+            from utils.rag_builder import load_index
+            _rag_index = load_index()
+        except Exception:
+            _rag_index = False   # mark as unavailable so we don't retry
+    return _rag_index if _rag_index else None
 
-def set_vectorstore(vs) -> None:
-    global _vectorstore
-    _vectorstore = vs
 
-# ── DB helper ─────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _conn() -> sqlite3.Connection:
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
-    return c
+def sql(query: str, params: dict = {}) -> pd.DataFrame:
+    return pd.read_sql(text(query), engine, params=params)
 
-# ── Time helper ───────────────────────────────────────────────────────────────
 
-def _gtfs_to_secs(t: str) -> int:
-    """HH:MM:SS (possibly >24h) → total seconds since midnight."""
+def rows(table: str, **where) -> pd.DataFrame:
+    conds = " AND ".join(f"{k}=:{k}" for k in where)
+    q     = f"SELECT * FROM {table}" + (f" WHERE {conds}" if conds else "")
+    return pd.read_sql(text(q), engine, params=where)
+
+
+def haversine(lat1, lon1, lat2, lon2) -> float:
+    R = 3958.8
+    a = math.sin(math.radians(lat2 - lat1) / 2) ** 2 + \
+        math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * \
+        math.sin(math.radians(lon2 - lon1) / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def expand_stop_ids(agency: str, stop_id: str) -> list[str]:
+    """Return platform-level stop IDs, expanding parent stations to their children.
+    Also climbs up to parent if given a child/entrance stop with no stop_times."""
+    def _children(parent: str) -> list[str]:
+        try:
+            df = sql(f"SELECT stop_id FROM {agency}_stops "
+                     f"WHERE parent_station=:sid AND (location_type IS NULL OR location_type != 1)",
+                     {"sid": parent})
+            return df["stop_id"].tolist() if not df.empty else []
+        except Exception:
+            return []
+
     try:
-        h, m, s = t.strip().split(":")
-        return int(h) * 3600 + int(m) * 60 + int(s)
-    except Exception:
-        return 0
+        row = sql(f"SELECT location_type, parent_station FROM {agency}_stops WHERE stop_id=:sid",
+                  {"sid": stop_id})
+        if row.empty:
+            return [stop_id]
+        loc_type = row.iloc[0]["location_type"]
+        parent   = row.iloc[0].get("parent_station")
 
-# ── Tool 1: get_current_time ─────────────────────────────────────────────────
+        if loc_type == 1:
+            kids = _children(stop_id)
+            return kids if kids else [stop_id]
+
+        # Child / entrance — climb to parent and expand from there
+        if parent and str(parent).strip():
+            kids = _children(str(parent))
+            return kids if kids else [stop_id]
+    except Exception:
+        pass
+    return [stop_id]
+
+
+def active_services(agency: str, stop_ids: list[str]) -> set:
+    today = datetime.now().strftime("%Y%m%d")
+    dow   = datetime.now().strftime("%A").lower()
+    try:
+        cal = sql(f"SELECT service_id FROM {agency}_calendar "
+                  f"WHERE {dow}=1 AND start_date<=:d AND end_date>=:d", {"d": today})
+        active = set(cal["service_id"])
+    except Exception:
+        active = set()
+    try:
+        added   = set(sql(f"SELECT service_id FROM {agency}_calendar_dates "
+                          f"WHERE date=:d AND exception_type='1'", {"d": today})["service_id"])
+        removed = set(sql(f"SELECT service_id FROM {agency}_calendar_dates "
+                          f"WHERE date=:d AND exception_type='2'", {"d": today})["service_id"])
+        active  = (active | added) - removed
+    except Exception:
+        pass
+    if not active:  # fallback for expired GTFS — sample from actual stop_times
+        ph = ",".join(f"'{s}'" for s in stop_ids)
+        try:
+            active = set(sql(f"SELECT DISTINCT t.service_id FROM {agency}_stop_times s "
+                             f"JOIN {agency}_trips t ON s.trip_id=t.trip_id "
+                             f"WHERE s.stop_id IN ({ph}) LIMIT 20")["service_id"])
+        except Exception:
+            pass
+    return active
+
+
+# ── Tools ─────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 def get_current_time() -> str:
-    """
-    Return the current date and time.
-    Always call this first when the user has not specified a departure time.
-    Returns JSON: {date, time (HH:MM:SS), day_of_week, unix_ts}
-    """
+    """Return current date and time. Call first when no departure time is given."""
     now = datetime.now()
     return json.dumps({
-        "date":        now.strftime("%Y-%m-%d"),
-        "time":        now.strftime("%H:%M:%S"),
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%H:%M:%S"),
         "day_of_week": now.strftime("%A"),
-        "unix_ts":     int(now.timestamp()),
     })
 
-# ── Tool 2: geocode_address ───────────────────────────────────────────────────
 
 @mcp.tool()
 def geocode_address(address: str) -> str:
-    """
-    Convert a street address into the 3 nearest transit stops across all agencies.
-    Uses Nominatim (OpenStreetMap) for geocoding — no API key needed.
-    address: e.g. '31 Hopkins Ave, Jersey City, NJ'
-    Returns JSON: {lat, lon, nearest_stops: [{stop_id, stop_name, agency, distance_miles}]}
-    Call this whenever the user gives a street address instead of a stop name.
-    """
-    import urllib.request
-    import urllib.parse
-
-    params = urllib.parse.urlencode({"q": address, "format": "json", "limit": 1})
-    url = f"https://nominatim.openstreetmap.org/search?{params}"
-    req = urllib.request.Request(url, headers={"User-Agent": "NJNavigator/1.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read())
-    except Exception as e:
-        return json.dumps({"error": f"Geocoding failed: {e}"})
-
+    """Convert a street address to the nearest transit stop per agency."""
+    resp = requests.get(
+        "https://nominatim.openstreetmap.org/search",
+        params={"q": address, "format": "json", "limit": 1},
+        headers={"User-Agent": "NJNavigator/1.0"},
+        timeout=8,
+    )
+    data = resp.json()
     if not data:
-        return json.dumps({"error": f"Address not found: {address}"})
+        return json.dumps({"error": "Address not found"})
 
-    lat = float(data[0]["lat"])
-    lon = float(data[0]["lon"])
+    lat, lon = float(data[0]["lat"]), float(data[0]["lon"])
+    nearest  = []
 
-    def _haversine(lat1, lon1, lat2, lon2) -> float:
-        R = 3958.8
-        phi1, phi2 = math.radians(lat1), math.radians(lat2)
-        dphi = math.radians(lat2 - lat1)
-        dlam = math.radians(lon2 - lon1)
-        a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
-        return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-    conn = _conn()
-    all_stops = []
-    for ag in ("mta", "path", "njt"):
+    for ag in AGENCIES:
         try:
-            rows = conn.execute(
-                f"SELECT stop_id, stop_name, stop_lat, stop_lon FROM {ag}_stops "
-                f"WHERE stop_lat IS NOT NULL AND stop_lat != '' "
-                f"AND (location_type IS NULL OR location_type = '0' OR location_type = 0)"
-            ).fetchall()
-            for r in rows:
-                try:
-                    slat, slon = float(r["stop_lat"]), float(r["stop_lon"])
-                except (TypeError, ValueError):
-                    continue
-                dist = _haversine(lat, lon, slat, slon)
-                all_stops.append({
-                    "stop_id":        r["stop_id"],
-                    "stop_name":      r["stop_name"],
-                    "agency":         ag.upper(),
-                    "distance_miles": round(dist, 3),
-                })
+            df   = sql(f"SELECT stop_id, stop_name, stop_lat, stop_lon FROM {ag}_stops "
+                       f"WHERE stop_lat IS NOT NULL AND stop_lat != '' "
+                       f"AND (location_type IS NULL OR location_type != 2)")
+            df   = df.dropna(subset=["stop_lat", "stop_lon"])
+            df["dist"] = df.apply(lambda r: haversine(lat, lon, float(r.stop_lat), float(r.stop_lon)), axis=1)
+            best = df.nsmallest(1, "dist").iloc[0]
+            nearest.append({"agency": ag.upper(), "stop_id": best.stop_id,
+                            "stop_name": best.stop_name, "distance_miles": round(best.dist, 3)})
         except Exception:
             pass
-    conn.close()
 
-    all_stops.sort(key=lambda x: x["distance_miles"])
-    return json.dumps({"lat": lat, "lon": lon, "nearest_stops": all_stops[:3]})
+    return json.dumps({"lat": lat, "lon": lon, "nearest_stops": nearest})
 
-# ── Tool 3: search_stops ─────────────────────────────────────────────────────
 
 @mcp.tool()
 def search_stops(query: str, agency: str = "all") -> str:
-    """
-    Search for transit stops by STOP NAME only (e.g. 'Grove Street', 'Penn Station').
-    Do NOT pass street addresses here — use geocode_address() for that.
-    agency: 'mta', 'path', 'njt', or 'all' (default).
-    Returns JSON list: [{stop_id, stop_name, agency, lat, lon}]
-    """
-    agencies = ["mta", "path", "njt"] if agency.lower() == "all" else [agency.lower()]
-    like = f"%{query.upper()}%"
-    results = []
-    conn = _conn()
+    """Search transit stops by name. agency: mta / path / njt / njtbus / all."""
+    agencies = AGENCIES if agency.lower() == "all" else [agency.lower()]
+    results  = []
     for ag in agencies:
         try:
-            rows = conn.execute(
-                f"SELECT stop_id, stop_name, stop_lat, stop_lon "
-                f"FROM {ag}_stops WHERE UPPER(stop_name) LIKE ? LIMIT 8",
-                (like,)
-            ).fetchall()
-            for r in rows:
-                results.append({
-                    "stop_id":   r["stop_id"],
-                    "stop_name": r["stop_name"],
-                    "agency":    ag.upper(),
-                    "lat":       r["stop_lat"],
-                    "lon":       r["stop_lon"],
-                })
+            df = sql(f"SELECT stop_id, stop_name FROM {ag}_stops "
+                     f"WHERE UPPER(stop_name) LIKE :q LIMIT 6", {"q": f"%{query.upper()}%"})
+            for _, r in df.iterrows():
+                results.append({"agency": ag.upper(), "stop_id": r.stop_id, "stop_name": r.stop_name})
         except Exception:
             pass
-    conn.close()
-    if not results:
-        return json.dumps({"message": f"No stops found matching '{query}'"})
-    return json.dumps({"stops": results})
+    return json.dumps({"stops": results} if results else {"message": f"No stops found for '{query}'"})
 
-# ── Tool 4: get_departures ────────────────────────────────────────────────────
 
 @mcp.tool()
-def get_departures(stop_id: str, agency: str, after_time: str) -> str:
+def get_departures(stop_id: str, agency: str, after_time: str, toward: str = "") -> str:
     """
-    Get next scheduled departures from a stop.
-    agency: 'mta', 'path', or 'njt'.
-    after_time: HH:MM:SS (e.g. '18:00:00'). Use 24-hour format.
-    Returns up to 6 next departures: [{departure_time, route, headsign, trip_id}]
+    Next scheduled departures from a stop.
+    agency: mta / path / njt / njtbus.  after_time: HH:MM:SS.
+    toward: optional headsign keyword to filter direction.
+    Pass the canonical stop_id (parent station or platform) — parent stations are expanded automatically.
     """
-    ag = agency.lower()
-    conn = _conn()
-    target_secs = _gtfs_to_secs(after_time)
+    ag       = agency.lower()
+    stop_ids = expand_stop_ids(ag, stop_id)
+    active   = active_services(ag, stop_ids)
+    if not active:
+        return json.dumps({"message": "No active services today."})
 
-    # If stop_id looks like a stop name (not numeric/code), resolve it first
-    if not stop_id.lstrip("-").replace("_", "").isdigit() and not any(c.isdigit() for c in stop_id[:4]):
-        try:
-            hit = conn.execute(
-                f"SELECT stop_id FROM {ag}_stops WHERE UPPER(stop_name) LIKE ? "
-                f"AND (location_type IS NULL OR location_type='0' OR location_type=0) LIMIT 1",
-                (f"%{stop_id.upper()}%",)
-            ).fetchone()
-            if hit:
-                stop_id = hit["stop_id"]
-        except Exception:
-            pass
+    svc_ph  = ",".join(f"'{s}'" for s in active)
+    stop_ph = ",".join(f"'{s}'" for s in stop_ids)
+    df = sql(f"""
+        SELECT st.departure_time, t.trip_headsign,
+               COALESCE(r.route_long_name, r.route_short_name, t.route_id) AS route_name
+        FROM   {ag}_stop_times st
+        JOIN   {ag}_trips t  ON st.trip_id  = t.trip_id
+        LEFT JOIN {ag}_routes r ON t.route_id = r.route_id
+        WHERE  st.stop_id IN ({stop_ph}) AND t.service_id IN ({svc_ph})
+        ORDER  BY st.departure_time
+    """)
 
-    # Resolve parent station → child stops (location_type=0 stops used in stop_times)
-    try:
-        loc = conn.execute(
-            f"SELECT location_type FROM {ag}_stops WHERE stop_id=?", (stop_id,)
-        ).fetchone()
-        if loc and str(loc["location_type"]) == "1":
-            children = conn.execute(
-                f"SELECT stop_id FROM {ag}_stops WHERE parent_station=? AND (location_type='0' OR location_type IS NULL)",
-                (stop_id,)
-            ).fetchall()
-            if children:
-                stop_id = children[0]["stop_id"]  # use first child platform
-    except Exception:
-        pass
+    df = df[df["departure_time"] >= after_time]
+    if toward:
+        mask = df["trip_headsign"].str.contains(toward, case=False, na=False)
+        if mask.any():
+            df = df[mask]
+        else:
+            note = f"No trains toward '{toward}' — showing all directions."
+            return json.dumps({"note": note, "departures": df.head(6).to_dict("records")})
 
-    # Get today's active service_ids
-    today = datetime.now().strftime("%Y%m%d")
-    dow   = datetime.now().strftime("%A").lower()
+    if df.empty:
+        return json.dumps({"message": "No upcoming departures."})
+    return json.dumps({"departures": df.head(6).to_dict("records")})
 
-    try:
-        active = set()
-
-        # Regular calendar
-        try:
-            rows = conn.execute(
-                f"SELECT service_id FROM {ag}_calendar "
-                f"WHERE {dow}='1' AND start_date<=? AND end_date>=?",
-                (today, today)
-            ).fetchall()
-            active = {r["service_id"] for r in rows}
-        except Exception:
-            pass
-
-        # calendar_dates additions / removals
-        try:
-            added = {r["service_id"] for r in conn.execute(
-                f"SELECT service_id FROM {ag}_calendar_dates WHERE date=? AND exception_type='1'",
-                (today,)
-            ).fetchall()}
-            removed = {r["service_id"] for r in conn.execute(
-                f"SELECT service_id FROM {ag}_calendar_dates WHERE date=? AND exception_type='2'",
-                (today,)
-            ).fetchall()}
-            active = (active | added) - removed
-        except Exception:
-            pass
-
-        # Fallback: GTFS calendar may be expired — use the most recent service_ids
-        # that actually have stop_times for this stop (covers stale static data).
-        if not active:
-            try:
-                fb = conn.execute(
-                    f"""
-                    SELECT DISTINCT t.service_id
-                    FROM   {ag}_stop_times st
-                    JOIN   {ag}_trips t ON st.trip_id = t.trip_id
-                    WHERE  st.stop_id = ?
-                    LIMIT  20
-                    """,
-                    (stop_id,)
-                ).fetchall()
-                active = {r["service_id"] for r in fb}
-            except Exception:
-                pass
-
-        if not active:
-            conn.close()
-            return json.dumps({"message": "No active services found for today."})
-
-        ph = ",".join("?" * len(active))
-        rows = conn.execute(
-            f"""
-            SELECT MIN(st.trip_id) AS trip_id,
-                   st.departure_time,
-                   t.route_id, t.trip_headsign
-            FROM   {ag}_stop_times st
-            JOIN   {ag}_trips t ON st.trip_id = t.trip_id
-            WHERE  st.stop_id = ?
-              AND  t.service_id IN ({ph})
-            GROUP  BY st.departure_time, t.route_id, t.trip_headsign
-            ORDER  BY st.departure_time
-            """,
-            [stop_id] + list(active)
-        ).fetchall()
-        conn.close()
-
-    except Exception as e:
-        conn.close()
-        return json.dumps({"error": str(e)})
-
-    deps = []
-    for r in rows:
-        if _gtfs_to_secs(r["departure_time"]) >= target_secs:
-            deps.append({
-                "departure_time": r["departure_time"],
-                "route":          r["route_id"],
-                "headsign":       r["trip_headsign"],
-            })
-            if len(deps) >= 6:
-                break
-
-    if not deps:
-        return json.dumps({"message": "No upcoming departures found from this stop."})
-    return json.dumps({"departures": deps})
-
-# ── Tool 5: get_realtime_status ───────────────────────────────────────────────
 
 @mcp.tool()
 def get_realtime_status(routes: str) -> str:
     """
-    Fetch live delay and arrival data from MTA and PATH realtime feeds.
-    routes: comma-separated route IDs, e.g. 'A,C,E' or '1,2,3' or 'PATH'.
-            Use 'PATH' to get next PATH arrivals by station.
-    Returns delays in seconds (positive = late) and PATH next arrivals.
+    Live MTA delays and PATH arrivals.
+    routes: comma-separated route letters e.g. 'A,C,E' or 'PATH'.
     """
-    if not _RT_AVAILABLE:
-        return json.dumps({"error": f"Realtime feed unavailable: {_RT_ERROR}"})
+    from utils.rt_loader import get_mta_delays, get_path_arrivals
+
     route_list = [r.strip().upper() for r in routes.split(",")]
-    result: dict = {"fetched_at": time.strftime("%H:%M:%S")}
+    result: dict = {}
 
     if "PATH" in route_list:
-        arrivals = get_path_arrivals()
-        result["path_arrivals"] = {
-            sid: arr[:3] for sid, arr in list(arrivals.items())[:8]
-        }
-
-    mta_routes = [r for r in route_list if r != "PATH"]
-    if mta_routes:
-        delays = get_mta_delays(mta_routes)
-        result["mta_delays"] = {
-            "delayed_trip_count": len(delays),
-            "sample_delays":      dict(list(delays.items())[:6]),
-            "note": "delay values in seconds; positive = late",
-        }
-
-    return json.dumps(result)
-
-# ── Tool 6: search_knowledge ──────────────────────────────────────────────────
-
-@mcp.tool()
-def search_knowledge(query: str) -> str:
-    """
-    Search the knowledge base for transit information.
-    Covers: MTA Subway, PATH Train, NJ Transit, GTFS, service alerts, general info.
-    Use for background questions like 'how many PATH lines are there' or
-    'what lines serve Penn Station' or 'is there a delay on the A train'.
-    Returns relevant text excerpts from Wikipedia articles and live MTA alerts.
-    """
-    if _vectorstore is None:
-        return json.dumps({"error": "Knowledge base not ready. Try again in a moment."})
-    from src.rag.retrieve import search_knowledge as _rag_search
-    chunks = _rag_search(_vectorstore, query, k=5)
-    return json.dumps({"results": chunks})
-
-# ── Tool 7: get_interchange_stations ─────────────────────────────────────────
-
-@mcp.tool()
-def get_interchange_stations(from_agency: str, to_agency: str) -> str:
-    """
-    Get transfer stations between two agencies.
-    from_agency / to_agency: 'MTA', 'PATH', or 'NJT'.
-    Returns station names, stop IDs for each agency, and minimum transfer time.
-    Use this when planning a cross-agency trip before calling get_departures.
-    """
-    fa, ta = from_agency.upper(), to_agency.upper()
-    col = {"MTA": "mta_stop_id", "PATH": "path_stop_id", "NJT": "njt_stop_id"}
-    if fa not in col or ta not in col:
-        return json.dumps({"error": f"Invalid agency. Use MTA, PATH, or NJT."})
-
-    if not INTERCHANGE_PATH.exists():
-        return json.dumps({"error": "interchange.csv not found."})
-
-    matches = []
-    with open(INTERCHANGE_PATH) as f:
-        for row in csv.DictReader(f):
-            fid = row.get(col[fa], "").strip()
-            tid = row.get(col[ta], "").strip()
-            if fid and tid:
-                matches.append({
-                    "station":                    row["station_name"],
-                    f"{fa.lower()}_stop_id":      fid,
-                    f"{ta.lower()}_stop_id":      tid,
-                    "min_transfer_minutes":       row.get("min_transfer_minutes", ""),
-                    "notes":                      row.get("notes", ""),
+        raw = get_path_arrivals()
+        formatted = {}
+        for stop_id, arrivals in list(raw.items())[:6]:
+            readable = []
+            for a in arrivals[:3]:
+                ts = a.get("arrival_time")
+                time_str = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone().strftime("%H:%M") if ts else "?"
+                readable.append({
+                    "arrival_time": time_str,
+                    "headsign": a.get("headsign", ""),
+                    "trip_id": a.get("trip_id", ""),
                 })
+            formatted[stop_id] = readable
+        result["path_arrivals"] = formatted
 
-    if not matches:
-        return json.dumps({"message": f"No interchange found between {fa} and {ta}."})
-    return json.dumps({"interchange_stations": matches})
+    mta = [r for r in route_list if r != "PATH"]
+    if mta:
+        delays = get_mta_delays(mta)
+        result["mta_delays"] = {"delayed_trip_count": len(delays)}
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+    return json.dumps(result or {"message": "No data."})
+
+
+@mcp.tool()
+def get_service_alerts(agency: str = "mta") -> str:
+    """
+    Active service disruption alerts.
+    agency: 'mta' (subway alerts) or 'path' (PATH has no separate alert feed — use get_realtime_status).
+    Returns up to 10 current alerts with affected routes and description.
+    """
+    agency = agency.lower()
+    if agency != "mta":
+        return json.dumps({"message": "Only MTA alerts are available. For PATH use get_realtime_status."})
+
+    from utils.rt_loader import get_mta_alerts
+    alerts = get_mta_alerts()
+    if not alerts:
+        return json.dumps({"message": "No active MTA service alerts."})
+    return json.dumps({"alerts": alerts[:10]})
+
+
+@mcp.tool()
+def get_transfers(stop_id: str, agency: str) -> str:
+    """Same-agency transfers available at a stop (from GTFS transfers.txt)."""
+    ag = agency.lower()
+    try:
+        df = sql(f"""
+            SELECT t.to_stop_id, t.transfer_type, t.min_transfer_time,
+                   s.stop_name
+            FROM   {ag}_transfers t
+            JOIN   {ag}_stops s ON t.to_stop_id = s.stop_id
+            WHERE  t.from_stop_id = :sid
+        """, {"sid": stop_id})
+        if df.empty:
+            return json.dumps({"message": "No transfers found at this stop."})
+        return json.dumps({"transfers": df.to_dict("records")})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_interchange(from_agency: str, to_agency: str) -> str:
+    """Cross-agency transfer stations between two agencies. Use: MTA, PATH, NJT, NJTBUS."""
+    INTERCHANGE = [
+        # MTA ↔ PATH
+        {"station": "World Trade Center",      "mta": "E01",   "path": "26734"},
+        {"station": "33rd Street",             "mta": "D17",   "path": "26724"},
+        # MTA ↔ NJT Rail
+        {"station": "New York Penn Station",   "mta": "128N",  "njt": "105"},
+        # MTA ↔ NJT Bus
+        {"station": "Port Authority Bus Term", "mta": "A27",   "njtbus": "3511"},
+        # PATH ↔ NJT Rail
+        {"station": "Hoboken Terminal",        "path": "26730", "njt": "63"},
+        {"station": "Newark Penn Station",     "path": "26733", "njt": "105"},
+        # PATH ↔ NJT Bus
+        {"station": "Journal Square",          "path": "26731", "njtbus": "2916"},
+        {"station": "Hoboken Terminal",        "path": "26730", "njtbus": "17082"},
+        {"station": "Newark Penn Station",     "path": "26733", "njtbus": "43283"},
+        # Three-way
+        {"station": "Hoboken Terminal",        "path": "26730", "njt": "63",  "njtbus": "17082"},
+        {"station": "Newark Penn Station",     "path": "26733", "njt": "105", "njtbus": "43283"},
+    ]
+
+    fa, ta = from_agency.lower(), to_agency.lower()
+    matches = [
+        {
+            "station":    s["station"],
+            f"{fa}_stop": s.get(fa, ""),
+            f"{ta}_stop": s.get(ta, ""),
+        }
+        for s in INTERCHANGE if s.get(fa) and s.get(ta)
+    ]
+
+    return json.dumps({"interchange": matches} if matches else {"message": "No interchange found."})
+
+
+@mcp.tool()
+def search_transit_knowledge(query: str) -> str:
+    """
+    Semantic search over transit route descriptions, station summaries, and transfer hubs.
+    Use this for questions like:
+      - "what lines serve Times Square?"
+      - "which PATH station is near WTC?"
+      - "tell me about the Northeast Corridor"
+      - "what NJT bus routes go to NYC?"
+    Do NOT use for live schedules or departure times — use get_departures for those.
+    """
+    idx = _get_rag_index()
+    if idx is None:
+        return json.dumps({"message": "Knowledge index not available."})
+    try:
+        docs = idx.similarity_search(query, k=4)
+        results = [{"content": d.page_content, "source": d.metadata} for d in docs]
+        return json.dumps({"results": results})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
 
 if __name__ == "__main__":
-    print("[MCP] Server starting on http://localhost:8000/mcp")
+    print("MCP server running on http://localhost:8000/mcp")
     mcp.run(transport="streamable-http", port=8000)
