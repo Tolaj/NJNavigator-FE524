@@ -9,6 +9,9 @@ lxml
 gtfs-realtime-bindings
 protobuf
 
+# GTFS static
+gtfs_kit
+
 # Database
 sqlalchemy
 
